@@ -22,11 +22,14 @@ if (key.IsFailure)
 }
 
 IClock clock = new SystemClock();
-IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromMinutes(10));
-Result<string> created = Result.Success("order-42");
+var store = new InMemoryIdempotencyStore();
+var executor = new IdempotentExecutor(store, clock);
 
-var replay = new IdempotencyReplay<string>(key.Value, created, clock.UtcNowOffset, lease);
-Result<string> replayed = replay.Replay(clock);
+Result<string> replayed = await executor.ExecuteAsync(
+    key.Value,
+    TimeSpan.FromMinutes(10),
+    _ => ValueTask.FromResult(Result.Success("order-42")),
+    cancellationToken);
 
 return replayed.Match(value => value, error => error.Message);
 ```
@@ -35,6 +38,9 @@ return replayed.Match(value => value, error => error.Message);
 
 - `IdempotencyKey` validates caller-provided keys and offers a `Result`-returning `Create` method for request input.
 - `IdempotencyLease` computes and evaluates UTC replay windows with `Atya.Foundation.Time.IClock`.
+- `IIdempotencyStore` atomically begins keys and stores completed results.
+- `InMemoryIdempotencyStore` provides a thread-safe proving implementation for tests, samples, and simple hosts.
+- `IdempotentExecutor` runs the begin -> execute -> complete -> replay flow for `Result<T>` operations.
 - `IdempotencyReplay<T>` replays a stored `Result<T>` until its lease expires.
 - `IdempotencyErrors` exposes stable error codes for duplicate in-progress and expired idempotency states.
 

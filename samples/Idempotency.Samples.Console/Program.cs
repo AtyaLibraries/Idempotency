@@ -10,9 +10,9 @@ namespace Atya.Application.Idempotency.Samples.ConsoleApp;
 public static class Program
 {
     /// <summary>
-    /// Demonstrates key validation, replay metadata, and expiration-aware replay.
+    /// Demonstrates key validation, idempotent execution, and result replay.
     /// </summary>
-    public static void Main()
+    public static async Task Main()
     {
         Result<IdempotencyKey> keyResult = IdempotencyKey.Create("orders:create:42");
         if (keyResult.IsFailure)
@@ -22,12 +22,20 @@ public static class Program
         }
 
         var clock = new SystemClock();
-        IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromMinutes(10));
-        Result<string> created = Result.Success("order-42");
+        var store = new InMemoryIdempotencyStore();
+        var executor = new IdempotentExecutor(store, clock);
 
-        var replay = new IdempotencyReplay<string>(keyResult.Value, created, clock.UtcNowOffset, lease);
-        Result<string> replayed = replay.Replay(clock);
+        Result<string> first = await executor.ExecuteAsync(
+            keyResult.Value,
+            TimeSpan.FromMinutes(10),
+            _ => ValueTask.FromResult(Result.Success("order-42")));
 
+        Result<string> replayed = await executor.ExecuteAsync(
+            keyResult.Value,
+            TimeSpan.FromMinutes(10),
+            _ => ValueTask.FromResult(Result.Success("should-not-run")));
+
+        Console.WriteLine(first.Match(value => $"Executed result: {value}", error => error.Message));
         Console.WriteLine(replayed.Match(value => $"Replayed result: {value}", error => error.Message));
     }
 }

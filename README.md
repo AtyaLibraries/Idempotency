@@ -14,7 +14,7 @@
 
 ## Overview
 
-`Atya.Application.Idempotency` provides storage-neutral primitives for application operations that may be retried by clients, queues, schedulers, or workflow engines. It validates caller-provided idempotency keys, records replay metadata, evaluates UTC expiration windows through `Atya.Foundation.Time`, and returns standard `Atya.Foundation.Results` failures for duplicate or expired operations.
+`Atya.Application.Idempotency` provides storage-neutral primitives and an execution path for application operations that may be retried by clients, queues, schedulers, or workflow engines. It validates caller-provided idempotency keys, atomically begins operations through a store, records replay metadata, evaluates UTC expiration windows through `Atya.Foundation.Time`, and returns standard `Atya.Foundation.Results` failures for duplicate or expired operations.
 
 The package does not prescribe persistence, locking, HTTP middleware, or a workflow framework. Applications keep those choices and use these primitives at their command or request boundary.
 
@@ -22,6 +22,9 @@ The package does not prescribe persistence, locking, HTTP middleware, or a workf
 
 - `IdempotencyKey` for validated, stable operation keys.
 - `IdempotencyLease` for UTC expiration windows based on an injected `IClock`.
+- `IIdempotencyStore` for atomic begin/complete state transitions.
+- `InMemoryIdempotencyStore` for tests, samples, and simple hosts.
+- `IdempotentExecutor` for the begin -> execute -> complete -> replay flow.
 - `IdempotencyReplay<T>` for replaying a stored `Result<T>` until its lease expires.
 - `IdempotencyErrors` for stable conflict error codes.
 
@@ -53,11 +56,14 @@ if (key.IsFailure)
 }
 
 IClock clock = new SystemClock();
-IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromMinutes(10));
-Result<string> created = Result.Success("order-42");
+var store = new InMemoryIdempotencyStore();
+var executor = new IdempotentExecutor(store, clock);
 
-var replay = new IdempotencyReplay<string>(key.Value, created, clock.UtcNowOffset, lease);
-Result<string> replayed = replay.Replay(clock);
+Result<string> replayed = await executor.ExecuteAsync(
+    key.Value,
+    TimeSpan.FromMinutes(10),
+    _ => ValueTask.FromResult(Result.Success("order-42")),
+    cancellationToken);
 
 return replayed.Match(value => value, error => error.Message);
 ```
@@ -87,6 +93,20 @@ IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromMinutes(15));
 bool expired = lease.IsExpired(clock);
 ```
 
+### Begin atomically
+
+`IIdempotencyStore.TryBeginAsync` is the synchronization point. Store implementations must ensure two concurrent callers with the same key cannot both receive `Begun`.
+
+```csharp
+IdempotencyBeginResult<OrderReceipt> begin = await store.TryBeginAsync<OrderReceipt>(
+    key,
+    lease,
+    clock,
+    cancellationToken);
+```
+
+`InMemoryIdempotencyStore` provides a thread-safe implementation for tests, samples, and simple single-process hosts. Durable stores such as EF Core or Redis are intentionally outside this package.
+
 ### Replay stored results
 
 Store your own operation result and replay it for matching keys until the lease expires.
@@ -95,6 +115,25 @@ Store your own operation result and replay it for matching keys until the lease 
 var replay = new IdempotencyReplay<OrderReceipt>(key, result, completedAtUtc, lease);
 Result<OrderReceipt> response = replay.Replay(clock);
 ```
+
+### Execute through the built-in flow
+
+Use `IdempotentExecutor` when the operation body already returns `Result<T>`.
+
+```csharp
+Result<OrderReceipt> result = await executor.ExecuteAsync(
+    key,
+    TimeSpan.FromMinutes(10),
+    ProcessOrderAsync,
+    cancellationToken);
+```
+
+The executor flow is:
+
+1. `TryBeginAsync`
+2. `Completed` -> replay the stored result
+3. `InProgress` -> return `atya.application.idempotency.in_progress`
+4. `Begun` -> run the operation, call `CompleteAsync`, return the operation result
 
 ## Error Codes
 
