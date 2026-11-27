@@ -1,62 +1,50 @@
 using Atya.Foundation.Guards;
 using Atya.Foundation.Results;
-using Atya.Foundation.Time;
 
 namespace Atya.Application.Idempotency;
 
 /// <summary>
-/// Represents a stored operation result that can be replayed for a matching idempotency key.
+/// Represents a stored result that can be replayed until its replay window ends.
 /// </summary>
-/// <typeparam name="TValue">The operation success value type.</typeparam>
+/// <typeparam name="TValue">The operation result value type.</typeparam>
 public sealed record class IdempotencyReplay<TValue>
 {
     /// <summary>
     /// Initializes a new instance of the <see cref="IdempotencyReplay{TValue}"/> class.
     /// </summary>
-    /// <param name="key">The idempotency key associated with the stored result.</param>
-    /// <param name="result">The stored operation result.</param>
-    /// <param name="completedAtUtc">The UTC instant when the operation completed.</param>
-    /// <param name="lease">The replay validity window.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="result"/> is null.</exception>
-    /// <exception cref="ArgumentException"><paramref name="completedAtUtc"/> does not use the UTC offset.</exception>
+    /// <param name="key">The idempotency key.</param>
+    /// <param name="result">The stored result.</param>
+    /// <param name="completedAtUtc">The UTC instant at which the result was stored.</param>
+    /// <param name="expiresAtUtc">The UTC instant at which the replay window ends.</param>
     public IdempotencyReplay(
         IdempotencyKey key,
         Result<TValue> result,
         DateTimeOffset completedAtUtc,
-        IdempotencyLease lease)
+        DateTimeOffset expiresAtUtc)
     {
         Key = key;
         Result = Guard.AgainstNull(result);
-        CompletedAtUtc = TimeGuard.AgainstNonUtc(completedAtUtc);
-        Lease = lease;
+        CompletedAtUtc = completedAtUtc;
+        ExpiresAtUtc = expiresAtUtc;
     }
 
     /// <summary>
-    /// Gets the idempotency key associated with the stored result.
+    /// Gets the idempotency key.
     /// </summary>
     public IdempotencyKey Key { get; }
 
     /// <summary>
-    /// Gets the stored operation result.
+    /// Gets the stored result.
     /// </summary>
     public Result<TValue> Result { get; }
 
     /// <summary>
-    /// Gets the UTC instant when the operation completed.
+    /// Gets the UTC instant at which the result was stored.
     /// </summary>
     public DateTimeOffset CompletedAtUtc { get; }
 
     /// <summary>
-    /// Gets the replay validity window.
+    /// Gets the UTC instant at which the replay window ends.
     /// </summary>
-    public IdempotencyLease Lease { get; }
-
-    /// <summary>
-    /// Replays the stored result when it has not expired.
-    /// </summary>
-    /// <param name="clock">The clock used to evaluate expiration.</param>
-    /// <returns>The stored result, or an expired idempotency failure.</returns>
-    /// <exception cref="ArgumentNullException"><paramref name="clock"/> is null.</exception>
-    public Result<TValue> Replay(IClock clock) =>
-        Lease.IsExpired(clock) ? IdempotencyErrors.ExpiredResult<TValue>(Key) : Result;
+    public DateTimeOffset ExpiresAtUtc { get; }
 }

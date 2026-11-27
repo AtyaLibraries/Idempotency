@@ -1,178 +1,143 @@
 using Atya.Foundation.Results;
+using Microsoft.Extensions.Time.Testing;
 
 namespace Atya.Application.Idempotency.UnitTests;
 
 public sealed class InMemoryIdempotencyStoreTests
 {
+    private readonly FakeTimeProvider _time = new(new DateTimeOffset(2026, 11, 27, 10, 0, 0, TimeSpan.Zero));
+
     [Fact]
-    public async Task TryBeginAsync_When_Key_Is_New_Returns_Begun()
+    public void Store_IsEphemeral()
     {
-        var store = new InMemoryIdempotencyStore();
-        var clock = new FakeClock(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero));
-        IdempotencyKey key = new("order:1");
-        IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromMinutes(5));
-
-        IdempotencyBeginResult<string> result = await store.TryBeginAsync<string>(
-            key,
-            lease,
-            clock,
-            TestContext.Current.CancellationToken);
-
-        result.Status.Should().Be(IdempotencyBeginStatus.Begun);
-        result.IsBegun.Should().BeTrue();
-        result.IsInProgress.Should().BeFalse();
-        result.IsCompleted.Should().BeFalse();
-        store.Keys.Should().ContainSingle().Which.Should().Be(key);
+        new InMemoryIdempotencyStore(_time).IsEphemeral.Should().BeTrue();
     }
 
     [Fact]
-    public async Task TryBeginAsync_When_Key_Is_In_Progress_Returns_InProgress()
+    public void Constructor_RejectsNullTimeProviderAndNonPositiveCapacity()
     {
-        var store = new InMemoryIdempotencyStore();
-        var clock = new FakeClock(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero));
-        IdempotencyKey key = new("order:2");
-        IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromMinutes(5));
-        await store.TryBeginAsync<string>(key, lease, clock, TestContext.Current.CancellationToken);
+        Action noTime = () => _ = new InMemoryIdempotencyStore(null!);
+        Action noCapacity = () => _ = new InMemoryIdempotencyStore(_time, 0);
 
-        IdempotencyBeginResult<string> result = await store.TryBeginAsync<string>(
-            key,
-            lease,
-            clock,
-            TestContext.Current.CancellationToken);
-
-        result.Status.Should().Be(IdempotencyBeginStatus.InProgress);
-        result.IsInProgress.Should().BeTrue();
-        result.Replay.Should().BeNull();
+        noTime.Should().Throw<ArgumentNullException>();
+        noCapacity.Should().Throw<ArgumentOutOfRangeException>();
     }
 
     [Fact]
-    public async Task TryBeginAsync_When_Key_Is_Completed_Returns_Replay()
+    public async Task Capacity_IsEnforced_AndReportedAsCapacityExceeded()
     {
-        var store = new InMemoryIdempotencyStore();
-        var clock = new FakeClock(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero));
-        IdempotencyKey key = new("order:3");
-        IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromMinutes(5));
-        await store.TryBeginAsync<string>(key, lease, clock, TestContext.Current.CancellationToken);
-        await store.CompleteAsync(key, Result.Success("created"), clock, TestContext.Current.CancellationToken);
+        var store = new InMemoryIdempotencyStore(_time, 3);
+        for (int i = 0; i < 3; i++)
+        {
+            (await store.TryBeginAsync<string>(new IdempotencyKey("k" + i), TimeSpan.FromMinutes(1), null, CancellationToken.None)).IsBegun.Should().BeTrue();
+        }
 
-        IdempotencyBeginResult<string> result = await store.TryBeginAsync<string>(
-            key,
-            lease,
-            clock,
-            TestContext.Current.CancellationToken);
+        var overflow = await store.TryBeginAsync<string>(new IdempotencyKey("k3"), TimeSpan.FromMinutes(1), null, CancellationToken.None);
 
-        result.Status.Should().Be(IdempotencyBeginStatus.Completed);
-        result.IsCompleted.Should().BeTrue();
-        result.Replay.Should().NotBeNull();
-        result.Replay!.Result.Value.Should().Be("created");
-        result.Replay.CompletedAtUtc.Should().Be(clock.UtcNowOffset);
+        overflow.Status.Should().Be(IdempotencyBeginStatus.CapacityExceeded);
+        store.Count.Should().Be(3);
     }
 
     [Fact]
-    public async Task TryBeginAsync_When_Record_Is_Expired_Replaces_Record_And_Returns_Begun()
+    public async Task ExpiredEntries_ArePurgedByExpiryOrder_FreeingCapacity()
     {
-        var store = new InMemoryIdempotencyStore();
-        var clock = new FakeClock(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero));
-        IdempotencyKey key = new("order:4");
-        IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromSeconds(1));
-        await store.TryBeginAsync<string>(key, lease, clock, TestContext.Current.CancellationToken);
-        clock.Advance(TimeSpan.FromSeconds(1));
+        var store = new InMemoryIdempotencyStore(_time, 2);
+        await store.TryBeginAsync<string>(new IdempotencyKey("short"), TimeSpan.FromSeconds(10), null, CancellationToken.None);
+        await store.TryBeginAsync<string>(new IdempotencyKey("long"), TimeSpan.FromMinutes(10), null, CancellationToken.None);
+        _time.Advance(TimeSpan.FromSeconds(11));
 
-        IdempotencyBeginResult<string> result = await store.TryBeginAsync<string>(
-            key,
-            IdempotencyLease.From(clock, TimeSpan.FromMinutes(5)),
-            clock,
-            TestContext.Current.CancellationToken);
+        var accepted = await store.TryBeginAsync<string>(new IdempotencyKey("new"), TimeSpan.FromMinutes(1), null, CancellationToken.None);
 
-        result.Status.Should().Be(IdempotencyBeginStatus.Begun);
+        accepted.IsBegun.Should().BeTrue();
+        store.Keys.Select(k => k.Value).Should().BeEquivalentTo("long", "new");
     }
 
     [Fact]
-    public async Task TryBeginAsync_When_Cancelled_Throws()
+    public async Task Property_EntryCountNeverExceedsTheBound_AcrossRandomOperations()
     {
-        var store = new InMemoryIdempotencyStore();
-        using var cancellation = new CancellationTokenSource();
-        await cancellation.CancelAsync();
+        var random = new Random(57);
+        var store = new InMemoryIdempotencyStore(_time, 25);
+        var executions = new List<IdempotencyExecution>();
 
-        var act = async () => await store.TryBeginAsync<string>(
-            new IdempotencyKey("order:5"),
-            new IdempotencyLease(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero)),
-            new FakeClock(new DateTimeOffset(2026, 7, 13, 9, 0, 0, TimeSpan.Zero)),
-            cancellation.Token);
+        for (int i = 0; i < 5000; i++)
+        {
+            var key = new IdempotencyKey("k" + random.Next(0, 80));
+            switch (random.Next(0, 5))
+            {
+                case 0:
+                case 1:
+                    var begin = await store.TryBeginAsync<string>(key, TimeSpan.FromSeconds(random.Next(1, 30)), null, CancellationToken.None);
+                    if (begin.IsBegun)
+                    {
+                        executions.Add(begin.Execution!);
+                    }
 
-        await act.Should().ThrowAsync<OperationCanceledException>();
+                    break;
+                case 2 when executions.Count > 0:
+                    await store.CompleteAsync(executions[random.Next(executions.Count)], Result.Success("v"), TimeSpan.FromSeconds(random.Next(1, 30)), CancellationToken.None);
+                    break;
+                case 3 when executions.Count > 0:
+                    await store.AbandonAsync(executions[random.Next(executions.Count)], CancellationToken.None);
+                    break;
+                default:
+                    _time.Advance(TimeSpan.FromSeconds(random.Next(0, 5)));
+                    break;
+            }
+
+            store.Count.Should().BeLessThanOrEqualTo(25);
+        }
     }
 
     [Fact]
-    public async Task TryBeginAsync_With_Null_Clock_Throws()
+    public async Task ManyRenewals_DoNotGrowTheExpiryQueueWithoutBound()
     {
-        var store = new InMemoryIdempotencyStore();
+        var store = new InMemoryIdempotencyStore(_time, 10);
+        var execution = (await store.TryBeginAsync<string>(new IdempotencyKey("k"), TimeSpan.FromSeconds(10), null, CancellationToken.None)).Execution!;
 
-        var act = async () => await store.TryBeginAsync<string>(
-            new IdempotencyKey("order:6"),
-            new IdempotencyLease(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero)),
-            null!,
-            TestContext.Current.CancellationToken);
+        for (int i = 0; i < 6000; i++)
+        {
+            (await store.RenewAsync(execution, TimeSpan.FromSeconds(10), CancellationToken.None)).Should().Be(IdempotencyTransition.Applied);
+        }
 
-        await act.Should().ThrowAsync<ArgumentNullException>();
+        _time.Advance(TimeSpan.FromSeconds(11));
+        (await store.TryBeginAsync<string>(new IdempotencyKey("k"), TimeSpan.FromSeconds(10), null, CancellationToken.None)).IsBegun.Should().BeTrue();
     }
 
     [Fact]
-    public async Task CompleteAsync_With_Null_Result_Throws()
+    public async Task Methods_RejectNullAndNonPositiveArguments()
     {
-        var store = new InMemoryIdempotencyStore();
-        var clock = new FakeClock(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero));
+        var store = new InMemoryIdempotencyStore(_time);
+        var execution = (await store.TryBeginAsync<string>(new IdempotencyKey("k"), TimeSpan.FromSeconds(10), null, CancellationToken.None)).Execution!;
 
-        var act = async () => await store.CompleteAsync<string>(
-            new IdempotencyKey("order:7"),
-            null!,
-            clock,
-            TestContext.Current.CancellationToken);
+        Func<Task> badLease = async () => await store.TryBeginAsync<string>(new IdempotencyKey("z"), TimeSpan.Zero, null, CancellationToken.None);
+        Func<Task> nullExecution = async () => await store.AbandonAsync(null!, CancellationToken.None);
+        Func<Task> nullResult = async () => await store.CompleteAsync<string>(execution, null!, TimeSpan.FromSeconds(1), CancellationToken.None);
+        Func<Task> badTtl = async () => await store.CompleteAsync(execution, Result.Success("v"), TimeSpan.Zero, CancellationToken.None);
+        Func<Task> badExtension = async () => await store.RenewAsync(execution, TimeSpan.Zero, CancellationToken.None);
 
-        await act.Should().ThrowAsync<ArgumentNullException>();
+        await badLease.Should().ThrowAsync<ArgumentOutOfRangeException>();
+        await nullExecution.Should().ThrowAsync<ArgumentNullException>();
+        await nullResult.Should().ThrowAsync<ArgumentNullException>();
+        await badTtl.Should().ThrowAsync<ArgumentOutOfRangeException>();
+        await badExtension.Should().ThrowAsync<ArgumentOutOfRangeException>();
     }
 
     [Fact]
-    public async Task CompleteAsync_With_Null_Clock_Throws()
+    public void ExecutionAndFence_RejectBlankValues()
     {
-        var store = new InMemoryIdempotencyStore();
+        Action blank = () => _ = new IdempotencyExecution(new IdempotencyKey("k"), new IdempotencyFence(" "), _time.GetUtcNow());
 
-        var act = async () => await store.CompleteAsync(
-            new IdempotencyKey("order:8"),
-            Result.Success("created"),
-            null!,
-            TestContext.Current.CancellationToken);
-
-        await act.Should().ThrowAsync<ArgumentNullException>();
+        blank.Should().Throw<ArgumentException>();
+        new IdempotencyFence("abc").ToString().Should().Be("abc");
     }
 
     [Fact]
-    public async Task CompleteAsync_When_Key_Has_Not_Begun_Throws()
+    public void BeginResultFactories_RejectNull()
     {
-        var store = new InMemoryIdempotencyStore();
-        var clock = new FakeClock(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero));
+        Action begun = () => IdempotencyBeginResult.Begun<string>(null!);
+        Action completed = () => IdempotencyBeginResult.Completed<string>(null!);
 
-        var act = async () => await store.CompleteAsync(
-            new IdempotencyKey("order:9"),
-            Result.Success("created"),
-            clock,
-            TestContext.Current.CancellationToken);
-
-        await act.Should().ThrowAsync<KeyNotFoundException>();
-    }
-
-    [Fact]
-    public async Task TryBeginAsync_When_Result_Type_Differs_Throws()
-    {
-        var store = new InMemoryIdempotencyStore();
-        var clock = new FakeClock(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero));
-        IdempotencyKey key = new("order:10");
-        IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromMinutes(5));
-        await store.TryBeginAsync<string>(key, lease, clock, TestContext.Current.CancellationToken);
-        await store.CompleteAsync(key, Result.Success("created"), clock, TestContext.Current.CancellationToken);
-
-        var act = async () => await store.TryBeginAsync<int>(key, lease, clock, TestContext.Current.CancellationToken);
-
-        await act.Should().ThrowAsync<InvalidOperationException>();
+        begun.Should().Throw<ArgumentNullException>();
+        completed.Should().Throw<ArgumentNullException>();
     }
 }

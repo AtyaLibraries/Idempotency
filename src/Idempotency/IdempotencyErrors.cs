@@ -18,6 +18,16 @@ public static class IdempotencyErrors
     public const string ExpiredCode = "atya.application.idempotency.expired";
 
     /// <summary>
+    /// Gets the stable error code used when a key is reused with a different request fingerprint or result type.
+    /// </summary>
+    public const string PayloadMismatchCode = "atya.application.idempotency.payload_mismatch";
+
+    /// <summary>
+    /// Gets the stable error code used when the store cannot accept another key.
+    /// </summary>
+    public const string CapacityExceededCode = "atya.application.idempotency.capacity_exceeded";
+
+    /// <summary>
     /// Creates a conflict error for a duplicate operation that is still in progress.
     /// </summary>
     /// <param name="key">The idempotency key that already has an active operation.</param>
@@ -50,4 +60,38 @@ public static class IdempotencyErrors
     /// <returns>A failed result containing <see cref="ExpiredCode"/>.</returns>
     public static Result<TValue> ExpiredResult<TValue>(IdempotencyKey key) =>
         Result.Failure<TValue>(Expired(key));
+
+    /// <summary>
+    /// Creates the error for a key that was reused with a different request fingerprint or result type.
+    /// </summary>
+    /// <param name="key">The idempotency key.</param>
+    /// <returns>The conflict error.</returns>
+    public static Error PayloadMismatch(IdempotencyKey key) =>
+        new(PayloadMismatchCode, $"The idempotency key '{key}' was already used with a different request.", ErrorKind.Conflict);
+
+    /// <summary>
+    /// Creates the error for a store that cannot accept another key.
+    /// </summary>
+    /// <param name="key">The idempotency key.</param>
+    /// <returns>The unavailable error.</returns>
+    public static Error CapacityExceeded(IdempotencyKey key) =>
+        new(CapacityExceededCode, $"The idempotency store is full; key '{key}' was not accepted.", ErrorKind.Unavailable);
+
+    /// <summary>
+    /// Creates a failed result for a payload mismatch.
+    /// </summary>
+    /// <typeparam name="TValue">The result value type.</typeparam>
+    /// <param name="key">The idempotency key.</param>
+    /// <returns>The failed result.</returns>
+    public static Result<TValue> PayloadMismatchResult<TValue>(IdempotencyKey key) =>
+        Result.Failure<TValue>(PayloadMismatch(key));
+
+    /// <summary>
+    /// Creates a failed result for a full store.
+    /// </summary>
+    /// <typeparam name="TValue">The result value type.</typeparam>
+    /// <param name="key">The idempotency key.</param>
+    /// <returns>The failed result.</returns>
+    public static Result<TValue> CapacityExceededResult<TValue>(IdempotencyKey key) =>
+        Result.Failure<TValue>(CapacityExceeded(key));
 }

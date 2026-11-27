@@ -49,4 +49,24 @@ public sealed class IdempotencyErrorsTests
         result.IsFailure.Should().BeTrue();
         result.Error.Code.Should().Be(IdempotencyErrors.ExpiredCode);
     }
+
+    [Fact]
+    public void PayloadMismatch_Creates_Conflict_Error()
+    {
+        Error error = IdempotencyErrors.PayloadMismatch(new IdempotencyKey("k"));
+
+        error.Code.Should().Be(IdempotencyErrors.PayloadMismatchCode);
+        error.Kind.Should().Be(ErrorKind.Conflict);
+        IdempotencyErrors.PayloadMismatchResult<int>(new IdempotencyKey("k")).Error.Code.Should().Be(IdempotencyErrors.PayloadMismatchCode);
+    }
+
+    [Fact]
+    public void CapacityExceeded_Creates_Unavailable_Error()
+    {
+        Error error = IdempotencyErrors.CapacityExceeded(new IdempotencyKey("k"));
+
+        error.Code.Should().Be(IdempotencyErrors.CapacityExceededCode);
+        error.Kind.Should().Be(ErrorKind.Unavailable);
+        IdempotencyErrors.CapacityExceededResult<int>(new IdempotencyKey("k")).Error.Code.Should().Be(IdempotencyErrors.CapacityExceededCode);
+    }
 }

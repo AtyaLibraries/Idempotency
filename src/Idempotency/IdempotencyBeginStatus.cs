@@ -19,4 +19,14 @@ public enum IdempotencyBeginStatus
     /// A completed result is available for replay.
     /// </summary>
     Completed = 2,
+
+    /// <summary>
+    /// The key exists with a different request fingerprint or result type.
+    /// </summary>
+    PayloadMismatch = 3,
+
+    /// <summary>
+    /// The store is full and cannot accept a new key.
+    /// </summary>
+    CapacityExceeded = 4,
 }
