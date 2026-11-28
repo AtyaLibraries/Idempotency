@@ -9,7 +9,7 @@
     <Company>Atya</Company>
     <Copyright>Copyright (c) 2026 Arsen Asulyan</Copyright>
     <Description>Idempotency primitives for safely handling repeated application operations.</Description>
-    <PackageTags>dotnet;atya;idempotency;results;time</PackageTags>
+    <PackageTags>dotnet;atya;idempotency;results</PackageTags>
     <RepositoryUrl>https://github.com/AtyaLibraries/Idempotency</RepositoryUrl>
     <PackageProjectUrl>$(RepositoryUrl)</PackageProjectUrl>
     <PackageValidationBaselineVersion>1.0.0</PackageValidationBaselineVersion>
@@ -28,7 +28,7 @@
   <ItemGroup Label="Runtime dependency">
     <PackageReference Include="Atya.Foundation.Guards" />
     <PackageReference Include="Atya.Foundation.Results" />
-    <PackageReference Include="Atya.Foundation.Time" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
   </ItemGroup>
 
 </Project>

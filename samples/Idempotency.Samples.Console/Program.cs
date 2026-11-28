@@ -1,6 +1,5 @@
 using Atya.Application.Idempotency;
 using Atya.Foundation.Results;
-using Atya.Foundation.Time;
 
 namespace Atya.Application.Idempotency.Samples.ConsoleApp;
 
@@ -21,18 +20,15 @@ public static class Program
             return;
         }
 
-        var clock = new SystemClock();
-        var store = new InMemoryIdempotencyStore();
-        var executor = new IdempotentExecutor(store, clock);
+        var store = new InMemoryIdempotencyStore(TimeProvider.System);
+        var executor = new IdempotentExecutor(store, TimeProvider.System);
 
         Result<string> first = await executor.ExecuteAsync(
             keyResult.Value,
-            TimeSpan.FromMinutes(10),
             _ => ValueTask.FromResult(Result.Success("order-42")));
 
         Result<string> replayed = await executor.ExecuteAsync(
             keyResult.Value,
-            TimeSpan.FromMinutes(10),
             _ => ValueTask.FromResult(Result.Success("should-not-run")));
 
         Console.WriteLine(first.Match(value => $"Executed result: {value}", error => error.Message));

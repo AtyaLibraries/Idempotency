@@ -1,5 +1,4 @@
 using Atya.Foundation.Results;
-using Atya.Foundation.Time;
 using BenchmarkDotNet.Attributes;
 
 namespace Atya.Application.Idempotency.Benchmarks;
@@ -10,23 +9,19 @@ namespace Atya.Application.Idempotency.Benchmarks;
 [MemoryDiagnoser]
 public class IdempotencyBenchmarks
 {
-    private readonly FakeClock _clock = new(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero));
-    private IdempotencyReplay<string> _replay = null!;
+    private static readonly IdempotencyKey s_replayKey = new("orders:create:replay");
     private IdempotentExecutor _executor = null!;
     private int _nextKey;
 
     /// <summary>
     /// Initializes benchmark fixtures.
     /// </summary>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     [GlobalSetup]
-    public void Setup()
+    public async Task Setup()
     {
-        _replay = new IdempotencyReplay<string>(
-            new IdempotencyKey("orders:create:42"),
-            Result.Success("order-42"),
-            _clock.UtcNowOffset,
-            new IdempotencyLease(_clock.UtcNowOffset.AddMinutes(10)));
-        _executor = new IdempotentExecutor(new InMemoryIdempotencyStore(), _clock);
+        _executor = new IdempotentExecutor(new InMemoryIdempotencyStore(TimeProvider.System, int.MaxValue), TimeProvider.System);
+        await _executor.ExecuteAsync(s_replayKey, _ => ValueTask.FromResult(Result.Success("order-42")));
     }
 
     /// <summary>
@@ -41,7 +36,8 @@ public class IdempotencyBenchmarks
     /// </summary>
     /// <returns>The replayed operation result.</returns>
     [Benchmark]
-    public Result<string> ReplayStoredResult() => _replay.Replay(_clock);
+    public ValueTask<Result<string>> ReplayStoredResult() =>
+        _executor.ExecuteAsync(s_replayKey, _ => ValueTask.FromResult(Result.Success("not-run")));
 
     /// <summary>
     /// Measures executing a new operation through the in-memory store.
@@ -51,15 +47,5 @@ public class IdempotencyBenchmarks
     public ValueTask<Result<string>> ExecuteNewOperation() =>
         _executor.ExecuteAsync(
             new IdempotencyKey($"orders:create:{Interlocked.Increment(ref _nextKey)}"),
-            TimeSpan.FromMinutes(10),
             _ => ValueTask.FromResult(Result.Success("order-42")));
-
-    private sealed class FakeClock(DateTimeOffset utcNow) : IClock
-    {
-        public DateTime UtcNow => utcNow.UtcDateTime;
-
-        public DateTimeOffset UtcNowOffset => utcNow;
-
-        public DateOnly TodayUtc => DateOnly.FromDateTime(utcNow.UtcDateTime);
-    }
 }
