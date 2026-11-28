@@ -14,18 +14,18 @@
 
 ## Overview
 
-`Atya.Application.Idempotency` provides storage-neutral primitives and an execution path for application operations that may be retried by clients, queues, schedulers, or workflow engines. It validates caller-provided idempotency keys, atomically begins operations through a store, records replay metadata, evaluates UTC expiration windows through `Atya.Foundation.Time`, and returns standard `Atya.Foundation.Results` failures for duplicate or expired operations.
+`Atya.Application.Idempotency` provides storage-neutral primitives and an execution path for application operations that may be retried by clients, queues, schedulers, or workflow engines. It validates caller-provided idempotency keys, atomically begins operations through a store, records replay metadata, fences ownership so a stale owner cannot overwrite a newer one, replays stored results for a window that starts at completion, and returns standard `Atya.Foundation.Results` failures for duplicate or conflicting operations.
 
 The package does not prescribe persistence, locking, HTTP middleware, or a workflow framework. Applications keep those choices and use these primitives at their command or request boundary.
 
 ## Features
 
 - `IdempotencyKey` for validated, stable operation keys.
-- `IdempotencyLease` for UTC expiration windows based on an injected `IClock`.
-- `IIdempotencyStore` for atomic begin/complete state transitions.
-- `InMemoryIdempotencyStore` for tests, samples, and simple hosts.
-- `IdempotentExecutor` for the begin -> execute -> complete -> replay flow.
-- `IdempotencyReplay<T>` for replaying a stored `Result<T>` until its lease expires.
+- `IdempotencyExecution` and `IdempotencyFence` for fenced ownership of a key.
+- `IIdempotencyStore` for atomic begin and fenced complete/renew/abandon transitions.
+- `InMemoryIdempotencyStore`, a bounded single-process store for tests, samples, and simple hosts.
+- `IdempotentExecutor` for the begin -> execute -> complete or abandon -> replay flow.
+- `IdempotencyReplay<T>` for replaying a stored `Result<T>` until its replay window ends.
 - `IdempotencyErrors` for stable conflict error codes.
 
 ## Installation
@@ -47,7 +47,6 @@ Install-Package Atya.Application.Idempotency
 ```csharp
 using Atya.Application.Idempotency;
 using Atya.Foundation.Results;
-using Atya.Foundation.Time;
 
 Result<IdempotencyKey> key = IdempotencyKey.Create("orders:create:42");
 if (key.IsFailure)
@@ -55,85 +54,72 @@ if (key.IsFailure)
     return key.Error.Message;
 }
 
-IClock clock = new SystemClock();
-var store = new InMemoryIdempotencyStore();
-var executor = new IdempotentExecutor(store, clock);
+var store = new InMemoryIdempotencyStore(TimeProvider.System);
+var executor = new IdempotentExecutor(store, TimeProvider.System);
 
-Result<string> replayed = await executor.ExecuteAsync(
+Result<string> result = await executor.ExecuteAsync(
     key.Value,
-    TimeSpan.FromMinutes(10),
     _ => ValueTask.FromResult(Result.Success("order-42")),
-    cancellationToken);
+    cancellationToken: cancellationToken);
 
-return replayed.Match(value => value, error => error.Message);
+return result.Match(value => value, error => error.Message);
 ```
 
 ## Feature Tour
 
 ### Validate caller keys
 
-Use `IdempotencyKey.Create` when the key comes from a request header, message property, or other caller input. Empty input returns a validation `Result` failure instead of throwing.
+Use `IdempotencyKey.Create` when the key comes from a request header, message property, or other caller input. Empty input returns a validation `Result` failure instead of throwing. Use the constructor when invalid input is a programmer error.
 
-```csharp
-Result<IdempotencyKey> key = IdempotencyKey.Create(headerValue);
-```
+### Fenced leases
 
-Use the constructor when invalid input is a programmer error inside your own code.
+`IIdempotencyStore.TryBeginAsync` is the synchronization point: two concurrent callers with the same key cannot both receive `Begun`. A successful begin returns an `IdempotencyExecution` holding an opaque `IdempotencyFence`. `CompleteAsync`, `RenewAsync` and `AbandonAsync` are compare-and-set operations on that fence and return an `IdempotencyTransition` (`Applied`, `Superseded`, `NotFound`), so an expired slow owner can never overwrite a newer owner. Stores own their `TimeProvider` and compute absolute expiries themselves; callers pass `TimeSpan` values.
 
-```csharp
-var key = new IdempotencyKey("payments:capture:abc123");
-```
+### Completion policy and abandon-on-exception
 
-### Compute UTC replay windows
+| Outcome | `SuccessOnly` (default) | `SuccessAndFailure` |
+|---|---|---|
+| Success `Result` | stored and replayed | stored and replayed |
+| Failure `Result` | abandoned (the caller can retry) | stored and replayed |
+| Exception | abandoned, rethrown | abandoned, rethrown |
+| Caller cancellation | abandoned, rethrown | abandoned, rethrown |
 
-`IdempotencyLease` uses `IClock` so tests and workers do not depend on wall-clock time.
+Handlers with non-compensated partial side effects must opt in to `SuccessAndFailure` (`IdempotencyExecutorOptions.CompletionPolicy`, or per call through `IdempotencyCallOptions`).
 
-```csharp
-IdempotencyLease lease = IdempotencyLease.From(clock, TimeSpan.FromMinutes(15));
-bool expired = lease.IsExpired(clock);
-```
+### The replay window starts at completion
 
-### Begin atomically
+The replay time-to-live is counted from the moment the result is stored, never from the start of a slow operation.
 
-`IIdempotencyStore.TryBeginAsync` is the synchronization point. Store implementations must ensure two concurrent callers with the same key cannot both receive `Begun`.
+### Finalization
 
-```csharp
-IdempotencyBeginResult<OrderReceipt> begin = await store.TryBeginAsync<OrderReceipt>(
-    key,
-    lease,
-    clock,
-    cancellationToken);
-```
+Completing or abandoning uses its own timeout (`FinalizationTimeout`), not the caller's `CancellationToken`. If finalization fails or times out the lease simply expires; the operation's result is still returned, the failure is logged at Error and passed to `IdempotencyExecutorOptions.OnFinalizationFailure`.
 
-`InMemoryIdempotencyStore` provides a thread-safe implementation for tests, samples, and simple single-process hosts. Durable stores such as EF Core or Redis are intentionally outside this package.
+### Request fingerprints
 
-### Replay stored results
+Pass `IdempotencyCallOptions.RequestFingerprint` to detect a key reused with a different request. A mismatch (or a replay requested with a different result type) returns `atya.application.idempotency.payload_mismatch`. A null fingerprint is unchecked.
 
-Store your own operation result and replay it for matching keys until the lease expires.
+### Bounded in-memory store
 
-```csharp
-var replay = new IdempotencyReplay<OrderReceipt>(key, result, completedAtUtc, lease);
-Result<OrderReceipt> response = replay.Replay(clock);
-```
+`InMemoryIdempotencyStore` is single-process only, keeps at most `MaxEntries` (default 10,000) entries, purges expired entries in expiry order on every mutating call, and returns `CapacityExceeded` (`atya.application.idempotency.capacity_exceeded`) when full. It is not shared between processes and is lost on restart (`IsEphemeral`). Durable stores are outside this package; `IdempotencyStoreConformanceTests` in the test project is the contract any store must pass.
 
 ### Execute through the built-in flow
-
-Use `IdempotentExecutor` when the operation body already returns `Result<T>`.
 
 ```csharp
 Result<OrderReceipt> result = await executor.ExecuteAsync(
     key,
-    TimeSpan.FromMinutes(10),
     ProcessOrderAsync,
+    new IdempotencyCallOptions { RequestFingerprint = requestHash },
     cancellationToken);
 ```
 
-The executor flow is:
+## Migrating from 1.x to 2.0
 
-1. `TryBeginAsync`
-2. `Completed` -> replay the stored result
-3. `InProgress` -> return `atya.application.idempotency.in_progress`
-4. `Begun` -> run the operation, call `CompleteAsync`, return the operation result
+- `IIdempotencyStore` changed: `TryBeginAsync` takes an execution lease and optional fingerprint, `CompleteAsync` takes the `IdempotencyExecution` and a replay time-to-live, and `RenewAsync`, `AbandonAsync` and `IsEphemeral` were added. Stores no longer receive an `IClock`.
+- `IdempotencyLease`, the `IClock` parameters and `IdempotencyReplay<T>.Lease` / `Replay(IClock)` are removed. `IdempotentExecutor` takes a `TimeProvider`, and `ExecuteAsync` takes `IdempotencyCallOptions` instead of a bare time-to-live. `InMemoryIdempotencyStore` takes a `TimeProvider`.
+- Behavior: failure `Result`s are no longer replayed by default. Opt in with `SuccessAndFailure` if your handler has partial side effects that are not compensated.
+- Behavior: an exception or cancellation releases the key immediately instead of leaving it in progress until the lease expires.
+- The `Atya.Foundation.Time` dependency is gone; `Microsoft.Extensions.Logging.Abstractions` was added for the finalization error log.
+- Last compatible version: 1.0.0.
 
 ## Error Codes
 
@@ -142,6 +128,8 @@ The executor flow is:
 | `atya.application.idempotency.key_required` | Validation | Caller input did not contain a usable idempotency key. |
 | `atya.application.idempotency.in_progress` | Conflict | A matching key already has an operation in progress. |
 | `atya.application.idempotency.expired` | Conflict | A matching idempotency record exists but is no longer valid for replay. |
+| `atya.application.idempotency.payload_mismatch` | Conflict | The key was reused with a different request fingerprint or result type. |
+| `atya.application.idempotency.capacity_exceeded` | Unavailable | The store is full and cannot accept a new key. |
 
 ## Why These Dependencies
 
@@ -149,7 +137,7 @@ The executor flow is:
 |---|---|
 | `Atya.Foundation.Guards` | Programmer-error guards for public constructors and methods. |
 | `Atya.Foundation.Results` | Expected validation, duplicate, and expired outcomes. |
-| `Atya.Foundation.Time` | UTC-safe expiration checks through `IClock` and `TimeGuard`. |
+| `Microsoft.Extensions.Logging.Abstractions` | Error log when finalization fails (logging abstractions only, no provider). |
 
 ## Compatibility
 
